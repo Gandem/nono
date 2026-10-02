@@ -6,6 +6,7 @@ use crate::command_policy::{
     CommandPoliciesConfig, CommandSandboxConfig, InterceptActionConfig, ResolvedCommandBinaries,
     ResolvedCommandBinary, has_explicit_self_invocation_entry,
 };
+use crate::tool_sandbox::CanonicalCwd;
 use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -3066,18 +3067,13 @@ fn build_child_launch_spec_for_binary(
 ) -> Result<ToolSandboxChildLaunchSpec> {
     verify_binary_identity(binary)?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|source| NonoError::PathCanonicalization {
-            path: cwd.clone(),
-            source,
-        })?;
+    let cwd = CanonicalCwd::new(&cwd)?;
     // Bound the command's live cwd to the agent's own granted filesystem;
     // rejects a cwd outside it (write non-escalation for cwd-scoped policy
     // grants is enforced per-path in add_policy_fs).
     super::admit_command_cwd(
         &request.command,
-        &cwd,
+        cwd.as_path(),
         &state.policy_root,
         &state.outer_caps,
         &state.deny_paths,
@@ -3102,7 +3098,7 @@ fn build_child_launch_spec_for_binary(
             preserve_caller_argv0,
         )?,
         env: filter_child_env(state, request, policy, context.caller, context.proxy_scope)?,
-        cwd: cwd.as_os_str().as_bytes().to_vec(),
+        cwd: cwd.as_path().as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
@@ -3145,7 +3141,7 @@ fn build_child_caps(
     binary: &ResolvedCommandBinary,
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
-    cwd: &Path,
+    cwd: &CanonicalCwd,
     proxy_scope: &str,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
@@ -3156,7 +3152,7 @@ fn build_child_caps(
     add_macos_runtime_baseline(&mut caps)?;
     add_executable_shape_baseline(&mut caps, binary)?;
     add_chaining_control_caps(&mut caps, state)?;
-    add_macos_cwd_metadata_rules(&mut caps, cwd)?;
+    add_macos_cwd_metadata_rules(&mut caps, cwd.as_path())?;
     add_policy_fs(
         &mut caps,
         policy,
@@ -3169,7 +3165,7 @@ fn build_child_caps(
         &mut caps,
         policy,
         &state.policy_root,
-        cwd,
+        cwd.as_path(),
         &state.outer_caps,
         &state.deny_paths,
     )?;
@@ -3588,7 +3584,7 @@ fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
     policy_root: &Path,
-    cwd: &Path,
+    canonical_cwd: &CanonicalCwd,
     outer_caps: &CapabilitySet,
     deny_paths: &[PathBuf],
 ) -> Result<()> {
@@ -3596,6 +3592,7 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
+    let cwd = canonical_cwd.as_path();
     for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
@@ -3603,8 +3600,14 @@ fn add_policy_fs(
     for entry in &policy.fs_write {
         for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
             let path = resolve_policy_path(&expanded, policy_root, cwd)?;
-            let access =
-                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            let access = super::policy_write_access(
+                entry,
+                &path,
+                policy_root,
+                canonical_cwd,
+                outer_caps,
+                deny_paths,
+            )?;
             add_optional_dir(caps, path, access)?;
         }
     }
@@ -3615,8 +3618,14 @@ fn add_policy_fs(
     for entry in &policy.fs_write_file {
         for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
             let path = resolve_policy_path(&expanded, policy_root, cwd)?;
-            let access =
-                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            let access = super::policy_write_access(
+                entry,
+                &path,
+                policy_root,
+                canonical_cwd,
+                outer_caps,
+                deny_paths,
+            )?;
             if matches!(access, AccessMode::Read) {
                 add_optional_read_file(caps, path)?;
             } else {
@@ -9340,6 +9349,7 @@ mod tests {
             .expect("rules");
         let binary = test_binary("sh", Path::new("/bin/sh")).expect("binary");
         let request = request_with_env(Vec::new());
+        let cwd = CanonicalCwd::new(&state.shim_dir).expect("canonical cwd");
         for directory in [false, true] {
             let policy: CommandSandboxConfig = serde_json::from_value(if directory {
                 serde_json::json!({"fs_write": [fixture.keychains]})
@@ -9347,15 +9357,8 @@ mod tests {
                 serde_json::json!({"fs_write_file": [fixture.login_db]})
             })
             .expect("policy");
-            let caps = build_child_caps(
-                &state,
-                &binary,
-                &policy,
-                &request,
-                &state.shim_dir,
-                "review",
-            )
-            .expect("child caps");
+            let caps = build_child_caps(&state, &binary, &policy, &request, &cwd, "review")
+                .expect("child caps");
             assert!(
                 caps.fs_capabilities().iter().any(|cap| {
                     cap.resolved == fixture.login_db.canonicalize().expect("canonical db")

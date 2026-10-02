@@ -9,6 +9,7 @@ use crate::command_policy::{
 };
 use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
+use crate::tool_sandbox::CanonicalCwd;
 use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
@@ -3584,19 +3585,14 @@ fn build_child_launch_spec_for_binary(
         start_vbi.elapsed()
     );
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|source| NonoError::PathCanonicalization {
-            path: cwd.clone(),
-            source,
-        })?;
+    let cwd = CanonicalCwd::new(&cwd)?;
 
     // Bound the command's live cwd to the agent's own granted filesystem;
     // rejects a cwd outside it (write non-escalation for cwd-scoped policy
     // grants is enforced per-path in add_policy_fs).
     super::admit_command_cwd(
         &request.command,
-        &cwd,
+        cwd.as_path(),
         &state.policy_root,
         &state.outer_caps,
         &state.deny_paths,
@@ -3683,7 +3679,7 @@ fn build_child_launch_spec_for_binary(
     for path in resolve_exec_paths(
         &policy.exec_paths,
         &state.policy_root,
-        &cwd,
+        cwd.as_path(),
         &state.outer_caps,
     )? {
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
@@ -3706,7 +3702,7 @@ fn build_child_launch_spec_for_binary(
             preserve_caller_argv0,
         )?,
         env,
-        cwd: cwd.as_os_str().as_bytes().to_vec(),
+        cwd: cwd.as_path().as_os_str().as_bytes().to_vec(),
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
@@ -3749,7 +3745,7 @@ fn build_child_caps(
     binary: &ResolvedCommandBinary,
     policy: &CommandSandboxConfig,
     request: &ToolSandboxShimRequest,
-    cwd: &Path,
+    cwd: &CanonicalCwd,
     proxy_scope: &str,
 ) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new().block_network();
@@ -3773,7 +3769,7 @@ fn build_child_caps(
         &mut caps,
         policy,
         &state.policy_root,
-        cwd,
+        cwd.as_path(),
         &state.outer_caps,
         &state.deny_paths,
     )?;
@@ -3990,7 +3986,7 @@ fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
     policy_root: &Path,
-    cwd: &Path,
+    canonical_cwd: &CanonicalCwd,
     outer_caps: &CapabilitySet,
     deny_paths: &[PathBuf],
 ) -> Result<()> {
@@ -3998,6 +3994,7 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
+    let cwd = canonical_cwd.as_path();
     for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
@@ -4005,8 +4002,14 @@ fn add_policy_fs(
     for entry in &policy.fs_write {
         for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
             let path = resolve_policy_path(&expanded, policy_root, cwd)?;
-            let access =
-                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            let access = super::policy_write_access(
+                entry,
+                &path,
+                policy_root,
+                canonical_cwd,
+                outer_caps,
+                deny_paths,
+            )?;
             add_optional_dir(caps, path, access)?;
         }
     }
@@ -4017,8 +4020,14 @@ fn add_policy_fs(
     for entry in &policy.fs_write_file {
         for expanded in expand_dynamic_tokens(std::slice::from_ref(entry), Some(cwd), outer_caps)? {
             let path = resolve_policy_path(&expanded, policy_root, cwd)?;
-            let access =
-                super::policy_write_access(entry, &path, policy_root, cwd, outer_caps, deny_paths)?;
+            let access = super::policy_write_access(
+                entry,
+                &path,
+                policy_root,
+                canonical_cwd,
+                outer_caps,
+                deny_paths,
+            )?;
             if matches!(access, AccessMode::Read) {
                 add_optional_read_file(caps, path)?;
             } else {

@@ -56,6 +56,10 @@ pub(crate) fn stop_signal_relay() {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod audit_context;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod canonical_cwd;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use canonical_cwd::CanonicalCwd;
 // Unconditional: readers of an event log classify decisions on every platform,
 // and both platforms' emitters type-check against the same vocabulary.
 pub(crate) mod command_policy_decision;
@@ -374,12 +378,14 @@ pub(crate) fn agent_can_write(
 /// $WORKDIR entries, and dynamic providers retain the existing per-path cwd
 /// non-escalation check. Keep the original entry: a provider can expand to an
 /// absolute path without making its grant an explicit fixed-path capability.
+/// The typed cwd carries the launch boundary's canonicalization guarantee, so
+/// symlink aliases cannot cause a raw/canonical cwd mismatch in this comparison.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn policy_write_access(
     entry: &str,
     path: &std::path::Path,
     policy_root: &std::path::Path,
-    cwd: &std::path::Path,
+    cwd: &CanonicalCwd,
     outer_caps: &nono::CapabilitySet,
     deny_paths: &[std::path::PathBuf],
 ) -> nono::Result<nono::AccessMode> {
@@ -388,7 +394,7 @@ pub(crate) fn policy_write_access(
         || !std::path::Path::new(&crate::profile::expand_vars(entry, policy_root)?).is_absolute();
     let normalized = lexically_normalize(path);
     if cwd_scoped
-        && normalized.starts_with(cwd)
+        && normalized.starts_with(cwd.as_path())
         && !agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
     {
         Ok(nono::AccessMode::Read)
@@ -399,6 +405,7 @@ pub(crate) fn policy_write_access(
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod policy_fs_tests {
+    use super::CanonicalCwd;
     use crate::command_policy::CommandSandboxConfig;
     use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
     use std::path::{Path, PathBuf};
@@ -407,7 +414,7 @@ mod policy_fs_tests {
         &mut CapabilitySet,
         &CommandSandboxConfig,
         &Path,
-        &Path,
+        &CanonicalCwd,
         &CapabilitySet,
         &[PathBuf],
     ) -> Result<()>;
@@ -466,9 +473,10 @@ mod policy_fs_tests {
     #[test]
     fn policy_write_classifies_fixed_and_cwd_scoped_entries() -> Result<()> {
         let _env_guard = lock_env();
-        let cwd = Path::new("/home/example");
-        let root = cwd.join("work");
-        let path = cwd.join("private");
+        let paths = paths()?;
+        let cwd = CanonicalCwd::new(&paths.home)?;
+        let root = cwd.as_path().join("work");
+        let path = cwd.as_path().join("private");
         let outer = CapabilitySet::new();
         for (entry, expected) in [
             ("~/.config/gh", AccessMode::ReadWrite),
@@ -486,7 +494,7 @@ mod policy_fs_tests {
                     entry,
                     &path,
                     &root,
-                    cwd,
+                    &cwd,
                     &outer,
                     std::slice::from_ref(&path)
                 )?,
@@ -501,6 +509,7 @@ mod policy_fs_tests {
     fn derived_policy_write_respects_outer_permissions_and_denies() -> Result<()> {
         let _env_guard = lock_env();
         let paths = paths()?;
+        let cwd = CanonicalCwd::new(&paths.home)?;
         let mut outer = CapabilitySet::new();
         outer.add_fs(FsCapability::new_dir(
             &paths.private,
@@ -511,7 +520,7 @@ mod policy_fs_tests {
                 "private",
                 &paths.private,
                 &paths.policy_root,
-                &paths.home,
+                &cwd,
                 &outer,
                 &[]
             )?,
@@ -522,7 +531,7 @@ mod policy_fs_tests {
                 "private",
                 &paths.private,
                 &paths.policy_root,
-                &paths.home,
+                &cwd,
                 &outer,
                 std::slice::from_ref(&paths.private)
             )?,
@@ -534,17 +543,41 @@ mod policy_fs_tests {
     #[test]
     fn derived_policy_write_normalizes_before_checking_authority() -> Result<()> {
         let _env_guard = lock_env();
-        let cwd = Path::new("/home/example");
-        let root = cwd.join("work");
+        let paths = paths()?;
+        let cwd = CanonicalCwd::new(&paths.home)?;
+        let root = cwd.as_path().join("work");
         let path = root.join("../private");
         assert_eq!(
             super::policy_write_access(
                 "work/../private",
                 &path,
                 &root,
-                cwd,
+                &cwd,
                 &CapabilitySet::new(),
-                &[cwd.join("private")]
+                &[cwd.as_path().join("private")]
+            )?,
+            AccessMode::Read
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derived_policy_write_downgrades_provider_path_with_symlinked_cwd() -> Result<()> {
+        let _env_guard = lock_env();
+        let paths = paths()?;
+        let alias = paths._temp.path().join("home-alias");
+        std::os::unix::fs::symlink(&paths.home, &alias)
+            .map_err(|source| io_error(&alias, source))?;
+        let cwd = CanonicalCwd::new(&alias)?;
+        assert_eq!(cwd.as_path(), paths.home);
+        assert_eq!(
+            super::policy_write_access(
+                "@git:common-dir",
+                &paths.private,
+                &paths.policy_root,
+                &cwd,
+                &CapabilitySet::new(),
+                &[]
             )?,
             AccessMode::Read
         );
@@ -565,15 +598,23 @@ mod policy_fs_tests {
         };
         // Moving cwd above a fixed grant must not revoke that command capability.
         for cwd in [&paths.home, &paths.home.join("repo")] {
+            let cwd = CanonicalCwd::new(cwd)?;
             let mut caps = CapabilitySet::new();
-            add_policy_fs(&mut caps, &policy, &paths.policy_root, cwd, &outer, &denies)?;
+            add_policy_fs(
+                &mut caps,
+                &policy,
+                &paths.policy_root,
+                &cwd,
+                &outer,
+                &denies,
+            )?;
             for path in [&paths.private, &paths.file] {
                 assert!(
                     caps.fs_capabilities().iter().any(|cap| {
                         cap.resolved == *path && cap.access == AccessMode::ReadWrite
                     }),
                     "explicit write was downgraded with cwd {}: {}",
-                    cwd.display(),
+                    cwd.as_path().display(),
                     path.display()
                 );
             }
@@ -582,7 +623,7 @@ mod policy_fs_tests {
                 &paths.read_only,
                 AccessMode::Write
             ));
-            assert!(!super::caps_grant(&caps, cwd, AccessMode::Write));
+            assert!(!super::caps_grant(&caps, cwd.as_path(), AccessMode::Write));
         }
         Ok(())
     }
@@ -598,18 +639,24 @@ mod policy_fs_tests {
             fs_write_file: vec!["private/credentials.db".into()],
             ..Default::default()
         };
-        let mut caps = CapabilitySet::new();
-        add_policy_fs(
-            &mut caps,
-            &policy,
-            &paths.policy_root,
-            &paths.home,
-            &outer,
-            &denies,
-        )?;
-        assert_eq!(caps.fs_capabilities().len(), 2);
-        assert!(!super::caps_grant(&caps, &paths.private, AccessMode::Write));
-        assert!(!super::caps_grant(&caps, &paths.file, AccessMode::Write));
+        let alias = paths._temp.path().join("home-alias");
+        std::os::unix::fs::symlink(&paths.home, &alias)
+            .map_err(|source| io_error(&alias, source))?;
+        for cwd in [&paths.home, &alias] {
+            let cwd = CanonicalCwd::new(cwd)?;
+            let mut caps = CapabilitySet::new();
+            add_policy_fs(
+                &mut caps,
+                &policy,
+                &paths.policy_root,
+                &cwd,
+                &outer,
+                &denies,
+            )?;
+            assert_eq!(caps.fs_capabilities().len(), 2);
+            assert!(!super::caps_grant(&caps, &paths.private, AccessMode::Write));
+            assert!(!super::caps_grant(&caps, &paths.file, AccessMode::Write));
+        }
         Ok(())
     }
 }
